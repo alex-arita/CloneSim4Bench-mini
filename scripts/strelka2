@@ -1,0 +1,105 @@
+#!/usr/bin/bash
+# strelka2
+#
+# Last Edit: 2024/12/06
+# By: Alex Fernando Arita
+# Version 1.2
+#
+# This script is meant to perform the variant calling using Strelka2 over the
+# mutated BAMs.
+
+# Default values for arguments
+FILE=""
+PROJECT_DIR=""
+REFERENCE=""
+
+# Activating conda environment
+source $(conda info --base)/etc/profile.d/conda.sh &>/dev/null
+conda init &> /dev/null
+conda activate strelka2 &> /dev/null
+
+show_help() {
+    echo "Usage: $0 -r <reference> -i <input_dir> -o <output_dir>"
+    echo ""
+    echo "Options:"
+    echo "  -r, --reference     Path to the reference genome (FASTA format)."
+    echo "  -i, --input-dir     Directory containing input BAM files."
+    echo "  -o, --output-dir    Directory for the output VCF files."
+    echo "  -h, --help          Show this help message."
+    echo ""
+    echo "Example:"
+    echo "  bash $0 -r /path/to/reference.fasta -i /path/to/BAMs -o /path/to/VCFs"
+    exit 0
+}
+
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -r|--reference)
+            REFERENCE="$2"
+            shift 2
+            ;;
+        -i|--input-dir)
+            INPUT_FOLDER="$2"
+            shift 2
+            ;;
+        -o|--output-dir)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_help
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            echo "Error: Invalid option."
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "$INPUT_FOLDER" || -z "$REFERENCE" || -z "$OUTPUT_DIR" ]]; then
+    echo "ERROR: Missing required arguments."
+    show_help
+    exit 1
+fi
+
+strelka2() {
+    BAM_FILE="$1"
+    folder_name=$(basename $BAM_FILE .sorted.dedup.recal.somatosim.bam)
+    configureStrelkaGermlineWorkflow.py \
+        --bam="$BAM_FILE" \
+        --referenceFasta="$REFERENCE" \
+        --exome \
+        --runDir="$OUTPUT_DIR"/"$folder_name"
+
+    while [ ! -f "$OUTPUT_DIR"/"$folder_name"/runWorkflow.py ]; do
+        sleep 10
+    done
+
+    python2 "$OUTPUT_DIR"/"$folder_name"/runWorkflow.py -m local -j 8
+}
+
+export -f strelka2
+export REFERENCE OUTPUT_DIR
+
+find "$INPUT_FOLDER" -name "*somatosim.bam"| parallel -j 6 strelka2 {}
+
+for file in "$OUTPUT_DIR"/*/results/variants/variants.vcf.gz; do
+    folder_name=$(basename $(dirname $(dirname $(dirname $file))))
+    mv "$file" "$OUTPUT_DIR"/"$folder_name".strelka2.vcf.gz
+    bcftools view -i 'FILTER="PASS"' "$OUTPUT_DIR"/"$folder_name".strelka2.vcf.gz > \
+                "$OUTPUT_DIR"/"$folder_name".strelka2.filtered.vcf
+    bcftools sort "$OUTPUT_DIR"/"$folder_name".strelka2.filtered.vcf > tmp
+    mv tmp "$OUTPUT_DIR"/"$folder_name".strelka2.filtered.vcf
+    bgzip "$OUTPUT_DIR"/"$folder_name".strelka2.filtered.vcf
+    bcftools index "$OUTPUT_DIR"/"$folder_name".strelka2.filtered.vcf.gz
+done
+
+rm -r "$OUTPUT_DIR"/*/
+rm "$OUTPUT_DIR"/*.strelka2.vcf.gz
+
+conda deactivate

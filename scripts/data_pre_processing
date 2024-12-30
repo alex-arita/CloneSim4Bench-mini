@@ -1,0 +1,175 @@
+#!/usr/bin/bash
+# data_pre_processing
+#
+# Last Edit: 2024/12/29
+# By: Alex Fernando Arita
+# Version 1.0
+#
+# Data pre-processing follows the guideline "Data pre-processing for variant
+# discovery" from GATK team to ensure analysis-ready BAMs for the process.
+
+# Default values for arguments
+REFERENCE=""
+INPUT_DIR=""
+PROJECT_DIR=""
+
+# Function to display help message
+show_help() {
+    echo "Usage: $0 -r <reference> -i <input_dir> -o <output_dir>"
+    echo ""
+    echo "Options:"
+    echo "  -i, --input-dir     Directory containing input FASTQ files."
+    echo "  -o, --output-dir    Directory to store the project."
+    echo "  -r, --reference     Path to the reference genome (FASTA format)."
+    echo "  -h, --help          Show this help message."
+    echo ""
+    echo "Example:"
+    echo "  bash $0 -i /path/to/inputs -o /path/to/outputs -r path/to/reference.fasta"
+    exit 0
+}
+
+# Parse command-line arguments using case
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -i|--input-dir)
+            INPUT_DIR=$(realpath "$2")
+            shift ;;
+        -o|--output-dir)
+            PROJECT_DIR=$(realpath "$2")
+            shift ;;
+        -r|--reference)
+            REFERENCE=$(realpath "$2")
+            shift ;;
+        -h|--help)
+            show_help ;;
+        *)
+            echo "Unknown parameter passed: $1"
+            show_help ;;
+    esac
+    shift
+done
+
+# Check for required arguments
+if [ -z "$REFERENCE" ] || [ -z "$INPUT_DIR" ] || [ -z "$PROJECT_DIR" ]; then
+    echo "ERROR: Missing required arguments."
+    show_help
+    exit 1
+fi
+
+# Define the directories to bind in the container
+BIND_PATHS="--bind $(dirname $REFERENCE):$(dirname $REFERENCE),$INPUT_DIR:$INPUT_DIR,$PROJECT_DIR:$PROJECT_DIR"
+
+# Activate the conda environment
+source $(conda info --base)/etc/profile.d/conda.sh
+conda init
+conda activate tools
+
+# Create reference.dict for GATK tools
+if [ ! -f ${REFERENCE%.fasta}]; then
+    echo "Creating sequence dictionary with GATK..."
+    singularity exec "$BIND_PATHS" tools/gatk_4.5.0.0.sif gatk CreateSequenceDictionary \
+        -R "$REFERENCE" \
+        -O "${REFERENCE%.fasta}.dict"
+else
+    echo "Sequence dictionary for GATK has been found!"
+fi
+
+process_file() {
+    local AR1=$1
+    local BASENAME=$(basename "$AR1")
+    BASENAME=${BASENAME%.R1.fastq.gz}
+    local ID=$(echo "$BASENAME" | cut -d "." -f 1)
+    local COV=$(echo "$BASENAME" | cut -d "." -f 4)
+    local AR2=${AR1%.R1.fastq.gz}.R2.fastq.gz
+
+    if [ -f "$AR1" ] && [ -f "$AR2" ]; then
+        DATETIME=$(date +"%Y%m%d_%H_%M_%S")
+        touch "$PROJECT_DIR"/Logs/"$DATETIME"_"$BASENAME"_dpp_start.log
+        bwa mem -t 8 \
+            -R "@RG\tID:${ID}\tLB:lib${ID}_${COV}\tPL:illumina\tPU:lane1\tSM:${ID}" \
+            "$REFERENCE" "$AR1" "$AR2" | \
+        samtools view -@ 8 -bS | \
+        samtools sort -@ 8 \
+            -o "$PROJECT_DIR"/BAMs/"$ID"."$COV".sorted.bam 2> \
+            "$PROJECT_DIR"/Logs/"$ID"."$COV".log
+
+        if [ $? -ne 0 ]; then
+            echo "ERROR: bwa mem or samtools failed for ${ID}.${COV}"
+            return 1
+        else
+            echo "${ID}.${COV} successfully aligned!"
+        fi
+
+        mkdir -p "$PROJECT_DIR"/tmp
+        singularity exec ${BIND_PATHS} tools/gatk_4.5.0.0.sif gatk MarkDuplicatesSpark \
+            -I "$PROJECT_DIR"/BAMs/${ID}.${COV}.sorted.bam \
+            -O "$PROJECT_DIR"/BAMs/${ID}.${COV}.sorted.dedup.bam \
+            -M "$PROJECT_DIR"/Metrics/${ID}.${COV}.metrics \
+            --tmp-dir "$PROJECT_DIR"/tmp
+
+        if [ $? -ne 0 ]; then
+            echo "ERROR: MarkDuplicatesSpark failed for ${ID}.${COV}" >&2
+            return 1
+        else
+            echo "${ID}.${COV} duplicates successfully marked!"
+        fi
+
+        singularity exec ${BIND_PATHS} tools/gatk_4.5.0.0.sif gatk BaseRecalibrator \
+            -I "$PROJECT_DIR"/BAMs/${ID}.${COV}.sorted.dedup.bam \
+            -R "$REFERENCE" \
+            --known-sites "$(dirname $REFERENCE)"/1000G*.vcf \
+            --known-sites "$(dirname $REFERENCE)"/hapmap*.vcf.gz \
+            --known-sites "$(dirname $REFERENCE)"/Homo_sapiens_assembly*.vcf \
+            --known-sites "$(dirname $REFERENCE)"/Mills_and_1000G*.vcf.gz \
+            -O ${PROJECT_DIR}/BAMs/${ID}.${COV}.sorted.dedup.recal.table \
+            --disable-sequence-dictionary-validation TRUE
+
+        if [ $? -ne 0 ]; then
+            echo "ERROR: BaseRecalibrator failed for ${ID}.${COV}" >&2
+            return 1
+        else
+            echo "${ID}.${COV} recalibration table successfully generated!"
+        fi
+
+        singularity exec ${BIND_PATHS} tools/gatk_4.5.0.0.sif gatk ApplyBQSR \
+            -R "$REFERENCE" \
+            -I "$PROJECT_DIR"/BAMs/${ID}.${COV}.sorted.dedup.bam \
+            --bqsr-recal-file \
+                "$PROJECT_DIR"/BAMs/${ID}.${COV}.sorted.dedup.recal.table \
+            -O "$PROJECT_DIR"/BAMs/${ID}.${COV}.sorted.dedup.recal.bam
+
+        DATETIME=$(date +"%Y%m%d_%H_%M_%S")
+        touch "$PROJECT_DIR"/Logs/"$DATETIME"_"$BASENAME"_dpp_end.log
+
+        if [ $? -ne 0 ]; then
+            echo "ERROR: ApplyBQSR failed for ${ID}.${COV}" >&2
+            return 1
+        else
+            echo "${ID}.${COV} successfully recalibrated!"
+        fi
+    else
+        echo "ERROR: Missing pair for ${ID}.${COV}" >&2
+        return 1
+    fi
+}
+
+export -f process_file
+export REFERENCE PROJECT_DIR
+
+# Check if there are any input files in the input directory
+if [ -z "$(find "$INPUT_DIR" -name "*.R1.fastq.gz")" ]; then
+    echo "ERROR: No input files found in directory $INPUT_DIR." >&2
+    exit 1
+fi
+
+# Loop through each input file and process it
+for file in "$INPUT_DIR"/*.R1.fastq.gz; do
+    if [ -f "$file" ]; then
+        process_file "$file"
+    else
+        echo "WARNING: No valid files found matching the pattern in $INPUT_DIR." >&2
+    fi
+done
+
+echo "BAMs are ready for variant simulation and discovery!"
+conda deactivate

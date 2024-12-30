@@ -1,0 +1,95 @@
+#!/usr/bin/bash
+# lofreq
+#
+# Last Edit: 2024/12/29
+# By: Alex Fernando Arita
+# Version 1.0
+#
+# This script is meant to perform the variant calling using LoFreq over the
+# mutated BAMs.
+
+# Default values for arguments
+FILE=""
+PROJECT_DIR=""
+REFERENCE=""
+
+# Activating conda environment
+source $(conda info --base)/etc/profile.d/conda.sh &>/dev/null
+conda init &> /dev/null
+conda activate lofreq &> /dev/null
+
+show_help() {
+    echo "Usage: $0 -r <reference> -i <input_dir> -o <output_dir>"
+    echo ""
+    echo "Options:"
+    echo "  -r, --reference     Path to the reference genome (FASTA format)."
+    echo "  -i, --input-dir     Directory containing input BAM files."
+    echo "  -o, --output-dir    Directory for the output VCF files."
+    echo "  -h, --help          Show this help message."
+    echo ""
+    echo "Example:"
+    echo "  bash $0 -r /path/to/reference.fasta -i /path/to/BAMs -o /path/to/VCFs"
+    exit 0
+}
+
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -r|--reference)
+            REFERENCE="$2"
+            shift 2
+            ;;
+        -i|--input-dir)
+            INPUT_FOLDER="$2"
+            shift 2
+            ;;
+        -o|--output-dir)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_help
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            echo "Error: Invalid option."
+            show_help
+            ;;
+    esac
+done
+
+if [[ -z "$INPUT_FOLDER" || -z "$REFERENCE" || -z "$OUTPUT_DIR" ]]; then
+    echo "ERROR: Missing required arguments."
+    show_help
+    exit 1
+fi
+
+lofreq_function() {
+    BAM_FILE="$1"
+    VCF_OUTPUT="$OUTPUT_DIR"/"$(basename "$BAM_FILE" .sorted.dedup.recal.somatosim.bam)".lofreq.vcf
+
+    lofreq call-parallel \
+        --ref "$REFERENCE" \
+        --out "$VCF_OUTPUT" \
+        --call-indels \
+        --pp-threads 4 \
+        --min-cov 30 \
+        --min-mq 30 \
+        --no-default-filter \
+        "$BAM_FILE"
+}
+
+export -f lofreq_function
+export REFERENCE OUTPUT_DIR
+
+find "$INPUT_FOLDER" -name "*somatosim.bam" | parallel -j 2 lofreq_function {}
+for file in $OUTPUT_DIR/*.vcf; do
+    bcftools sort "$file" >  tmp
+    mv tmp "$file"
+    bgzip "$file"
+    bcftools index "$file".gz
+done
+
+conda deactivate &> /dev/null

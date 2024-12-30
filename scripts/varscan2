@@ -1,0 +1,99 @@
+#!/usr/bin/bash
+# varscan2
+#
+# Last Edit: 2024/12/29
+# By: Alex Fernando Arita
+# Version 1.0
+#
+# This script is meant to perform the variant calling using FreeBayes over the
+# mutated BAMs. This script includes an extra step to filter out variant with
+# not enough support.
+
+# Default values for arguments
+FILE=""
+PROJECT_DIR=""
+REFERENCE=""
+
+show_help() {
+    echo "Usage: $0 -r <reference> -i <input_dir> -o <output_dir>"
+    echo ""
+    echo "Options:"
+    echo "  -r, --reference     Path to the reference genome (FASTA format)."
+    echo "  -i, --input-dir     Directory containing input BAM files."
+    echo "  -o, --output-dir    Directory for the output VCF files."
+    echo "  -h, --help          Show this help message."
+    echo ""
+    echo "Example:"
+    echo "  bash $0 -r /path/to/reference.fasta -i /path/to/BAMs -o /path/to/VCFs"
+    exit 0
+}
+
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -r|--reference)
+            REFERENCE="$2"
+            shift 2
+            ;;
+        -i|--input-dir)
+            INPUT_FOLDER="$2"
+            shift 2
+            ;;
+        -o|--output-dir)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_help
+            ;;
+        *)
+            echo "Error: Invalid option."
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "$INPUT_FOLDER" || -z "$REFERENCE" || -z "$OUTPUT_DIR" ]]; then
+    echo "ERROR: Missing required arguments."
+    show_help
+    exit 1
+fi
+
+# Create tmp directory
+mkdir -p "$OUTPUT_DIR"/tmp_pileup/
+
+varscan(){
+    BAM_FILE="$1"
+    tmp=$(basename "$BAM_FILE" .sorted.dedup.recal.somatosim.bam)
+    VCF_OUTPUT="$OUTPUT_DIR"/"$tmp".varscan2.vcf
+    
+    # Create pileup file
+    if [ ! -f "$OUTPUT_DIR"/tmp_pileup/"$tmp".pileup ]; then
+        samtools mpileup -f "$REFERENCE" "$BAM_FILE" > "$OUTPUT_DIR"/tmp_pileup/"$tmp".pileup
+    fi
+
+    # Run VarScan to create VCF
+    java -jar tools/varscan/VarScan.v2.4.6.jar mpileup2cns \
+        "$OUTPUT_DIR/tmp_pileup/${tmp}.pileup" \
+        --output-vcf 1 \
+        --variants \
+        --min-coverage 30 \
+        --min-avg-qual 30 \
+        --min-var-freq 0.005 \
+        --p-value 0.05 > "$VCF_OUTPUT"
+}
+
+export -f varscan
+export REFERENCE OUTPUT_DIR
+
+find "$INPUT_FOLDER" -name "*somatosim.bam" | parallel -j 6 varscan {}
+
+for file in "$OUTPUT_DIR"/*.vcf; do
+    filtered="${file%.vcf}".filtered.vcf
+    bcftools view -i "FILTER == 'PASS' & ADF >= 1 & ADR >= 1" "$file" >> "$filtered"
+    bgzip "$filtered"
+    bcftools index "$filtered".gz
+    rm -f "$file"
+done
+
+rm -r "$OUTPUT_DIR"/tmp_pileup/

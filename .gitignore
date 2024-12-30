@@ -1,0 +1,8 @@
+# Ignore files
+*.log
+*.err
+*.out
+*.sif
+
+# Ignore folders
+tools/varscan

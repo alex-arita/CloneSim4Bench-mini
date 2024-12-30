@@ -1,0 +1,108 @@
+#!/usr/bin/bash
+# sim_guided
+#
+# Last Edit: 2024/12/29
+# By: Alex Fernando Arita
+# Version 1.0
+#
+# Guided simulation to create a clonal hematopoiesis-like dataset using
+# variants described in COSMIC, aiming to minimize the potential randomness
+# bias that could be introduced by stochastic methods.
+
+# Default values for arguments
+FILE=""
+PROJECT_DIR=""
+NUMBER=""
+
+source $(conda info --base)/etc/profile.d/conda.sh &> /dev/null
+conda init &> /dev/null
+conda activate tools &> /dev/null
+
+# Function to display help message
+show_help() {
+    echo "Usage: $0 -f <file_for_simulation> -i <PROJECT_DIR> -n <number_of_variants>"
+    echo ""
+    echo "Options:"
+    echo "  -f, --file          VCF file to be used as reference."
+    echo "  -i, --input-dir     Directory containing the project."
+    echo "  -n, --number        Number of variants to be simulated."
+    echo "  -h, --help          Show this help message."
+    echo ""
+    echo "Example:"
+    echo "  bash $0 -f reference/COSMIC.vcf -i /path/to/inputs -n 10000 -s SEED"
+    exit 0
+}
+
+# Parse command-line arguments using case
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -f|--file)
+            FILE="$2";
+            shift ;;
+        -i|--input-dir)
+            PROJECT_DIR="$2";
+            shift ;;
+        -n|--number)
+            NUMBER="$2";
+            shift ;;
+        -h|--help)
+            show_help ;;
+        *)
+            echo "Unknown parameter passed: $1";
+            show_help ;;
+    esac
+    shift
+done
+
+# Check for required arguments
+if [ -z "$FILE" ] || [ -z "$PROJECT_DIR" ] || [ -z "$NUMBER" ]; then
+    echo "ERROR: Missing required arguments."
+    show_help
+    exit 1
+fi
+
+# Main function
+somatic_mutation() {
+    DATETIME=$(date +"%Y%m%d_%H_%M_%S")
+    PREFIX=$(basename "$1" .sorted.dedup.recal.bam)
+    touch "$PROJECT_DIR"/Logs/"$DATETIME"_"$PREFIX"_sim_guided_start.log
+    SEED=$(($RANDOM%1000))
+
+    # Execute BED4SV.py
+    python3 scripts/BED4SV.py \
+        -i "$FILE" \
+        -o "$PROJECT_DIR"/BEDs/Guided/"$PREFIX" \
+        -n $((NUMBER * 5)) \
+        --vaf-low 0.02 \
+        --vaf-high 0.2 \
+        -s "$SEED"
+    echo "BED4SV Done!"
+
+    while [ ! -f "$PROJECT_DIR"/BEDs/Guided/"$PREFIX".bed ]; do
+        sleep 10;
+    done
+
+
+    # Execute SomatoSim
+    echo "Executing SomatoSim with $NUMBER SNVs..."
+    singularity exec --bind "$(realpath $PROJECT_DIR):/root" tools/somatosim_latest.sif somatosim \
+    -i /root/BAMs/$(basename $1) \
+    -b /root/BEDs/Guided/"$PREFIX".bed \
+    -o /root/BAMs_mutated/Guided/"$PREFIX" \
+    --number-snv "$NUMBER" \
+    --random-seed "$SEED"
+    echo "SomatoSim Done!"
+
+    DATETIME=$(date +"%Y%m%d_%H_%M_%S")
+    touch "$PROJECT_DIR"/Logs/"$DATETIME"_"$PREFIX"_sim_guided_end.log
+}
+
+# Export function and variables
+export -f somatic_mutation
+export FILE PROJECT_DIR NUMBER SEED
+
+# Find BAM files and pass them to parallel
+files=$(find $(realpath "$PROJECT_DIR"/BAMs) -name "*.bam")
+echo "$files" | parallel -j 6 somatic_mutation
+
+conda deactivate $&> /dev/null

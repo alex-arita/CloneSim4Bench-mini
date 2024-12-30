@@ -1,0 +1,180 @@
+#!/usr/bin/bash
+# mutect2
+#
+# Last Edit: 2024/12/10
+# By: Alex Fernando Arita
+# Version 1.4
+#
+# This script is meant to perform variant calling using Mutect2 over the
+# mutated BAMs. This script includes steps to filter out variants with
+# insufficient support.
+
+# Default values for arguments
+INPUT_DIR=""
+OUTPUT_DIR=""
+REFERENCE=""
+
+# Activating conda environment
+source $(conda info --base)/etc/profile.d/conda.sh &>/dev/null
+conda init &> /dev/null
+conda activate tools &> /dev/null
+
+# Show help message
+show_help() {
+    echo "Usage: $0 -r <reference> -i <input_dir> -o <output_dir>"
+    echo ""
+    echo "Options:"
+    echo "  -r, --reference     Path to the reference genome (FASTA format)."
+    echo "  -i, --input-dir     Directory containing input BAM files."
+    echo "  -o, --output-dir    Directory for the output VCF files."
+    echo "  -h, --help          Show this help message."
+    echo ""
+    echo "Example:"
+    echo "  bash $0 -r /path/to/reference.fasta -i /path/to/BAMs -o /path/to/VCFs"
+    exit 0
+}
+
+# Parse arguments
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -r|--reference)
+            REFERENCE="$2"
+            shift 2
+            ;;
+        -i|--input-dir)
+            INPUT_DIR="$2"
+            shift 2
+            ;;
+        -o|--output-dir)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_help
+            ;;
+        *)
+            echo "Error: Invalid option."
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# Validate required arguments
+if [[ -z "$INPUT_DIR" || -z "$REFERENCE" || -z "$OUTPUT_DIR" ]]; then
+    echo "ERROR: Missing required arguments."
+    show_help
+    exit 1
+fi
+
+# Ensure required tools are available
+for tool in singularity bcftools parallel; do
+    if ! command -v "$tool" &>/dev/null; then
+        echo "ERROR: $tool is not installed or not in PATH."
+        exit 1
+    fi
+done
+
+# Prepare environment
+mkdir -p "$OUTPUT_DIR"/tmp/
+
+# Create genome intervals if not present
+if [[ ! -f "$REFERENCE.fai" ]]; then
+    echo "ERROR: Index file (.fai) for reference genome not found."
+    exit 1
+fi
+awk '{print $1"\t0\t"$2}' "$REFERENCE.fai" > "$(dirname $REFERENCE)/whole_genome_intervals.bed"
+
+run_mutect2() {
+    local sample_name="$(basename "$1" .sorted.dedup.recal.somatosim.bam)"
+
+    if [ ! -f "$OUTPUT_DIR"/tmp/"$sample_name".mutect2.vcf ]; then
+        singularity exec \
+            --bind "$(realpath $OUTPUT_DIR):/Mutect2" \
+            --bind "$(realpath $(dirname $1)):/BAM_path" \
+            --bind "$(realpath $(dirname $REFERENCE)):/Reference" \
+            tools/gatk_4.5.0.0.sif \
+            gatk Mutect2 \
+            -R /Reference/"$(basename $REFERENCE)" \
+            -I /BAM_path/"$(basename $1)" \
+            -O /Mutect2/tmp/"$sample_name".mutect2.vcf \
+            --native-pair-hmm-threads 4
+    else
+        echo "Skipped, file already exist!"
+    fi
+}
+
+# Define contamination analysis function
+run_contamination_analysis() {
+    local sample_name="$(basename "$1" .sorted.dedup.recal.somatosim.bam)"
+
+    if [ ! -f "$OUTPUT_DIR"/tmp/"$sample_name".pileup ]; then
+        singularity exec \
+            --bind "$(realpath $OUTPUT_DIR):/Mutect2" \
+            --bind "$(realpath $(dirname $1)):/BAM_path" \
+            --bind "$(realpath $(dirname $REFERENCE)):/Reference" \
+            tools/gatk_4.5.0.0.sif \
+            gatk GetPileupSummaries \
+            -I /BAM_path/"$(basename $1)" \
+            -L /Reference/whole_genome_intervals.bed \
+            -V /Reference/1000G.phase3.integrated.sites_only.no_MATCHED_REV.hg38.vcf \
+            -O /Mutect2/tmp/"$sample_name".pileup
+    else
+        echo "Skipped, file already exist!"
+    fi
+
+    if [[ $? -ne 0 ]]; then
+        echo "GetPileupSummaries failed for $bam_file. Exiting."
+        exit 1
+    fi
+
+    if [ ! -f "$OUTPUT_DIR"/tmp/"$sample_name".ctable ]; then
+        singularity exec \
+            --bind "$(realpath $OUTPUT_DIR):/Mutect2" \
+            tools/gatk_4.5.0.0.sif \
+            gatk CalculateContamination \
+            -I /Mutect2/tmp/"$sample_name".pileup \
+            -O /Mutect2/tmp/"$sample_name".ctable
+    else
+        echo "Skipped, file already exist!"
+    fi
+}
+
+# Define FilterMutectCalls function
+run_filter_mutect_calls() {
+    local sample_name="$(basename "$1" .mutect2.vcf)"
+
+    singularity exec \
+        --bind "$(realpath $OUTPUT_DIR):/Mutect2" \
+        --bind "$(realpath $(dirname $REFERENCE)):/Reference" \
+        tools/gatk_4.5.0.0.sif \
+        gatk FilterMutectCalls \
+        -V /Mutect2/tmp/"$sample_name".mutect2.vcf \
+        --contamination-table /Mutect2/tmp/"$sample_name".ctable \
+        -R /Reference/"$(basename $REFERENCE)" \
+        -O /Mutect2/"$sample_name".annotated.vcf
+}
+
+# Run analysis in parallel
+export -f run_mutect2 run_contamination_analysis run_filter_mutect_calls
+export REFERENCE OUTPUT_DIR
+
+find "$INPUT_DIR" -name "*.bam" | parallel -j 6 run_contamination_analysis {}
+find "$INPUT_DIR" -name "*.bam" | parallel -j 2 run_mutect2 {}
+
+find "$OUTPUT_DIR/tmp" -name "*.mutect2.vcf" | parallel -j 6 run_filter_mutect_calls {}
+
+# Final filtering
+for file in "$OUTPUT_DIR"/*.annotated.vcf; do
+    filtered="${file%.annotated.vcf}.filtered.vcf"
+    bcftools view -i 'FILTER="PASS" || FILTER="clustered_events"' "$file" > "$filtered"
+    bcftools sort "$filtered" > tmp
+    mv tmp "$filtered"
+    bgzip "$filtered"
+    bcftools index "$filtered".gz
+    rm "$file"*
+done
+
+# Cleanup temporary files
+rm -r "$OUTPUT_DIR"/tmp
+conda deactivate &> /dev/null

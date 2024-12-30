@@ -1,0 +1,82 @@
+#!/usr/bin/bash
+# vcf_compare
+#
+# Last Edit: 2024/12/06
+# By: Alex Fernando Arita
+# Version 1.0
+#
+
+# Activating conda environment
+source $(conda info --base)/etc/profile.d/conda.sh &>/dev/null
+conda init &> /dev/null
+conda activate tools &> /dev/null
+
+# Default values for arguments
+PROJECT_DIR=""
+GENERAL_RESULTS=""
+DETAILED_RESULTS=""
+
+
+show_help() {
+    echo "Usage: $0 -i <input_dir> -o1 <output_file1> -o2 <output_file2>"
+    echo ""
+    echo "Options:"
+    echo "  -i, --input-dir     Directory containing input FASTQ files."
+    echo "  -o1, --output-file1 Directory to store output general results."
+    echo "  -o2, --output-file2 Directory to store output detailed results."
+    echo "  -h, --help          Show this help message."
+    echo ""
+    echo "Example:"
+    echo "  bash $0 -i /path/to/inputs -o1 /path/to/general_results -o2 /path/to/detailed_results"
+    exit 0
+}
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -i|--input-dir)
+            PROJECT_DIR="$2"
+            shift ;;
+        -o1|--output-file1)
+            GENERAL_RESULTS="$2"
+            shift ;;
+        -o2|--output-file2)
+            DETAILED_RESULTS="$2"
+            shift ;;
+        -h|--help)
+            show_help ;;
+        *)
+            echo "Unknown parameter passed: $1"
+            show_help ;;
+    esac
+    shift
+done
+
+# Check for required arguments
+if [ -z "$PROJECT_DIR" ] || [ -z "$GENERAL_RESULTS" ] || [ -z "$DETAILED_RESULTS" ]; then
+    echo "ERROR: Missing required arguments."
+    show_help
+    exit 1
+fi
+
+for FILE in "$PROJECT_DIR"/REFs/*_all.vcf.gz; do
+    PREFIX=$(basename "$FILE" "_all.vcf.gz")
+    BASE="${FILE%_all.vcf.gz}"
+    echo $PREFIX
+
+    for VC in FreeBayes LoFreq Mutect2 Strelka2 VarScan2; do
+        if [ -f $PROJECT_DIR/$VC/$PREFIX*.vcf.gz ]; then
+            echo "$FILE" $PROJECT_DIR/$VC/$PREFIX*.vcf.gz
+        else
+            echo "WARNING: No VCF files found for $VC matching $VCF_FILE"
+        fi
+
+        for AF_RANGE in "_AF_0_to_002" "_AF_002_to_005" "_AF_005_to_01" "_AF_01_to_1"; do
+            if [ -f $BASE$AF_RANGE.vcf.gz ]; then
+                echo $BASE$AF_RANGE.vcf.gz $PROJECT_DIR/$VC/$PREFIX*.vcf.gz 
+            else
+                echo "WARNING: File not found - $VCF_FILE"
+            fi
+        done
+    done
+done
+conda deactivate &> /dev/null

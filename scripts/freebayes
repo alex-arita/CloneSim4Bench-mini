@@ -1,0 +1,96 @@
+#!/usr/bin/bash
+# freebayes
+#
+# Last Edit: 2024/12/29
+# By: Alex Fernando Arita
+# Version 1.0
+#
+# This script is meant to perform the variant calling using FreeBayes over the
+# mutated BAMs. This script includes an extra step to filter out variant with
+# not enough support.
+
+# Default values for arguments
+FILE=""
+PROJECT_DIR=""
+REFERENCE=""
+
+show_help() {
+    echo "Usage: $0 -r <reference> -i <input_dir> -o <output_dir>"
+    echo ""
+    echo "Options:"
+    echo "  -r, --reference     Path to the reference genome (FASTA format)."
+    echo "  -i, --input-dir     Directory containing input BAM files."
+    echo "  -o, --output-dir    Directory for the output VCF files."
+    echo "  -h, --help          Show this help message."
+    echo "Example:"
+    echo "  bash $0 -r /path/to/reference.fasta -i /path/to/BAMs -o /path/to/VCFs"
+    exit 0
+}
+
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -r|--reference)
+            REFERENCE="$2"
+            shift 2
+            ;;
+        -i|--input-dir)
+            INPUT_FOLDER="$2"
+            shift 2
+            ;;
+        -o|--output-dir)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_help
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            echo "Error: Invalid option."
+            show_help
+            ;;
+    esac
+done
+
+if [[ -z "$INPUT_FOLDER" || -z "$REFERENCE" || -z "$OUTPUT_DIR" ]]; then
+    echo "ERROR: Missing required arguments."
+    show_help
+    exit 1
+fi
+
+freebayes_sm() {
+    BAM_FILE="$1"
+    VCF_OUTPUT="${OUTPUT_DIR}"/"$(basename "$BAM_FILE" .sorted.dedup.recal.somatosim.bam)".freebayes.vcf
+
+    freebayes -f "$REFERENCE" "$BAM_FILE" \
+        --vcf "$VCF_OUTPUT" \
+        --min-alternate-fraction 0.01 \
+        --min-alternate-count 2 \
+        --min-base-quality 30 \
+        --min-mapping-quality 30 \
+        --haplotype-length 3 \
+        --pooled-continuous \
+        --use-mapping-quality \
+        --throw-away-complex-obs \
+        --no-partial-observations \
+        --genotype-qualities
+}
+
+export -f freebayes_sm
+export REFERENCE OUTPUT_DIR
+
+find "$INPUT_FOLDER" -name "*somatosim.bam" | parallel -j 6 freebayes_sm {}
+
+for file in "$OUTPUT_DIR"/*.freebayes.vcf; do
+    filtered="${file%.vcf}".filtered.vcf
+    bcftools view -i "FORMAT/DP >= 10 & MQM >=30" "$file" >> "$filtered"
+    bcftools sort "$filtered" > tmp
+    mv tmp "$filtered"
+    bgzip "$filtered"
+    bcftools index "$filtered".gz
+    rm -f "$file"
+
+done

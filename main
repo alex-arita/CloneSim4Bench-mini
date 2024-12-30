@@ -1,0 +1,459 @@
+#!/bin/bash
+# Main
+#
+# Last Edit: 2024/12/29
+# By: Alex Fernando Arita
+# Version 1.0
+#
+# CloneSim4Bench is a framework dedicated to simulate the expected conditions
+# for clonal hematopoiesis in WES from peripheral blood samples. This version
+# is meant to test the proof of concept behind.
+
+# Default values for arguments
+REFERENCE=""
+INPUT_DIR=""
+PROJECT_DIR=""
+VCF_File=""
+BED_File=""
+
+# Function to display help message
+show_help() {
+    echo "Usage: $0 -i <input_dir> -o <project_dir> -r <reference> -v <vcf_file> -b <bed_file>"
+    echo ""
+    echo "Options:"
+    echo "  -i, --input-dir     Directory containing input FASTQ files."
+    echo "  -o, --output-dir    Directory to store the project."
+    echo "  -r, --REFERENCE     Path to the reference genome (FASTA format)."
+    echo "  -v, --vcf           Directory to VCF to be used for guided simulation"
+    echo "  -b, --bed           Directory to BED to be used for stochastic simulation"
+    echo "  -h, --help          Show this help message."
+    echo ""
+    echo "Example:"
+    echo "  bash $0 -i /path/to/FASTQs -o /path/to/project -r path/to/reference.fasta -v path/to/cosmic.vcf -b path/to/probes.bed"
+    exit 0
+}
+
+echo "==============================================================="
+echo "                       CloneSim4Bench-mini                     "
+echo "==============================================================="
+
+# Parse command-line arguments using case
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -r|--REFERENCE)
+            REFERENCE="$2";
+            shift ;;
+        -i|--input-dir)
+            INPUT_DIR="$2";
+            shift ;;
+        -o|--output-dir)
+            PROJECT_DIR="$2";
+            shift ;;
+        -v|--vcf)
+            VCF_File="$2";
+            shift ;;
+        -b|--bed)
+            BED_File="$2";
+            shift ;;
+        -h|--help)
+            show_help ;;
+        *)
+            echo "Unknown parameter passed: $1";
+            show_help ;;
+    esac
+    shift
+done
+
+# Check for required arguments
+if [ -z "$REFERENCE" ] || [ -z "$INPUT_DIR" ] || [ -z "$PROJECT_DIR" ] || \
+    [ -z "$VCF_File" ] || [ -z "$BED_File" ]; then
+    echo "ERROR: Missing required arguments."
+    show_help
+    exit 1
+fi
+
+
+# ******************************************************************************
+# *                                                                            *
+# *               S e t t i n g   u p   e n v i r o n m e n t                  *
+# *                                                                            *
+# ******************************************************************************
+
+source $(conda info --base)/etc/profile.d/conda.sh &>/dev/null
+conda init &> /dev/null
+conda activate tools &> /dev/null
+
+echo -e "\nSetting up environment\n----------------------"
+
+# Create output directories
+bash scripts/create_directories.sh "$PROJECT_DIR"
+
+# Copy the REFERENCE to the output directory
+if [ ! -f "$PROJECT_DIR"/REFERENCE/"$(basename "$REFERENCE" .gz)" ]; then
+    cp "$REFERENCE" "$PROJECT_DIR"/REFERENCE/
+    gunzip "$PROJECT_DIR"/REFERENCE/"$(basename "$REFERENCE")"
+fi
+
+REFERENCE_FILE="$PROJECT_DIR"/REFERENCE/"$(basename "$REFERENCE" .gz)"
+
+# Indexes and dictionaries
+if [[ -f "${REFERENCE_FILE}.bwt" && -f "${REFERENCE_FILE}.sa" \
+      && -f "${REFERENCE_FILE}.pac" ]]; then
+    echo "BWA index already created"
+else
+    echo "Creating BWA index..."
+    bwa index "$REFERENCE_FILE" 1> /dev/null 2> logs/bwa_error.log
+    echo "BWA index done!"
+fi
+
+if [[ ! -f "${REFERENCE_FILE%.fasta}.dict" && ! \
+      -f "${REFERENCE_FILE%.fa}.dict" ]]; then
+    echo "Creating FASTA dictionary with GATK..."
+    singularity exec \
+        --bind "$(realpath "$(dirname "$REFERENCE_FILE")"):/Reference" \
+        tools/gatk_4.5.0.0.sif \
+        gatk CreateSequenceDictionary \
+        -R /Reference/"$(basename "$REFERENCE_FILE")" &> /dev/null
+    echo "FASTA index done!"
+else
+    echo "FASTA dictionary (.dict) already exists"
+fi
+
+if [[ -f "${REFERENCE_FILE}.fai" ]]; then
+    echo "FASTA index (.fai) already exists"
+else
+    echo "Creating FASTA index with samtools..."
+    samtools faidx "$REFERENCE_FILE"
+    echo "FASTA index done!"
+fi
+
+
+# Conditional REFERENCE file downloads based on genome version
+if [[ $REFERENCE == *38* ]]; then
+    echo -e "\nKnown-variants for GATK tools\n-----------------------------"
+    # List of required files
+    FILES=(
+    "gs://genomics-public-data/resources/broad/hg38/v0/1000G.phase3.integrated.sites_only.no_MATCHED_REV.hg38.vcf"
+    "gs://genomics-public-data/resources/broad/hg38/v0/1000G.phase3.integrated.sites_only.no_MATCHED_REV.hg38.vcf.idx"
+    "gs://genomics-public-data/resources/broad/hg38/v0/Homo_sapiens_assembly38.dbsnp138.vcf"
+    "gs://genomics-public-data/resources/broad/hg38/v0/Homo_sapiens_assembly38.dbsnp138.vcf.idx"
+    "gs://genomics-public-data/resources/broad/hg38/v0/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz"
+    "gs://genomics-public-data/resources/broad/hg38/v0/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz.tbi"
+    "gs://genomics-public-data/resources/broad/hg38/v0/hapmap_3.3.hg38.vcf.gz"
+    "gs://genomics-public-data/resources/broad/hg38/v0/hapmap_3.3.hg38.vcf.gz.tbi"
+    )
+
+    # Download if not available
+    for FILE in "${FILES[@]}"; do
+        BASENAME=$(basename "$FILE")
+        LOCAL_PATH="$PROJECT_DIR"/REFERENCE/"$BASENAME"
+
+        if [ ! -f "$LOCAL_PATH" ]; then
+            echo "Downloading $BASENAME..."
+            gsutil cp "$FILE" "$PROJECT_DIR"/REFERENCE/
+        else
+            echo "$BASENAME already exists, skipping download."
+        fi
+    done
+
+elif [[ $REFERENCE == *37* || $REFERENCE == *19* ]]; then
+    echo -e "\nKnown-variants for GATK tools"
+    FILES=(
+        "gs://gcp-public-data--broad-REFERENCEs/hg19/v0/1000G_phase1.snps.high_confidence.b37.vcf.gz"
+        "gs://gcp-public-data--broad-REFERENCEs/hg19/v0/1000G_phase1.snps.high_confidence.b37.vcf.gz.tbi"
+        "gs://gcp-public-data--broad-REFERENCEs/hg19/v0/Homo_sapiens_assembly19.dbsnp.vcf"
+        "gs://gcp-public-data--broad-REFERENCEs/hg19/v0/Homo_sapiens_assembly19.dbsnp.vcf.idx"
+        "gs://gcp-public-data--broad-REFERENCEs/hg19/v0/Mills_and_1000G_gold_standard.indels.b37.vcf.gz"
+        "gs://gcp-public-data--broad-REFERENCEs/hg19/v0/Mills_and_1000G_gold_standard.indels.b37.vcf.gz.tbi"
+        "gs://gcp-public-data--broad-REFERENCEs/hg19/v0/hapmap_3.3.b37.vcf.gz"
+        "gs://gcp-public-data--broad-REFERENCEs/hg19/v0/hapmap_3.3.b37.vcf.gz.tbi"
+    )
+
+    # Download if not available
+    for FILE in "${FILES[@]}"; do
+        BASENAME=$(basename "$FILE")
+        LOCAL_PATH="$PROJECT_DIR/REFERENCE/$BASENAME"
+
+        if [ ! -f "$LOCAL_PATH" ]; then
+            echo "Downloading $BASENAME..."
+            gsutil cp "$FILE" "$PROJECT_DIR/REFERENCE/"
+        else
+            echo "$BASENAME already exists, skipping download."
+        fi
+    done
+fi
+
+
+# ******************************************************************************
+# *                                                                            *
+# *                  d a t a   p r e - p r o c e s s i n g                     *
+# *                                                                            *
+# ******************************************************************************
+
+echo -e "\nData pre-processing\n-------------------"
+
+# Launch job
+if compgen -G "$PROJECT_DIR"/BAMs/*sorted.dedup.recal.bam > /dev/null; then
+    echo "BAMs have been found in the folder. Overwrite has been cowardly avoided."
+else
+    echo "Executing FASTQs alignment, deduplication, and base recalibration..."
+    echo "(This may take a while)"
+    bash scripts/data_pre_processing \
+        -r "$REFERENCE_FILE" \
+        -i "$INPUT_DIR" \
+        -o "$PROJECT_DIR" \
+        1> /dev/null 2> logs/dpp_error.log
+    wait
+
+    # Remove unnecessary files
+    rm -r "$PROJECT_DIR"/tmp
+    rm "$PROJECT_DIR"/BAMs/*sorted.bam* \
+       "$PROJECT_DIR"/BAMs/*dedup.bam* \
+       "$PROJECT_DIR"/BAMs/*recal.table
+
+fi
+
+
+# ******************************************************************************
+# *                                                                            *
+# *                                S o m a t o S i m                           *
+# *                                                                            *
+# ******************************************************************************
+
+echo -e "\nSomatic Mutation Simulation\n---------------------------"
+
+# Check if SomatoSim sif image is available at resources
+if [ ! -f tools/somatosim_latest.sif ]; then
+    echo "Downloading SomatoSim..."
+    singularity pull docker://marwanhawari/somatosim:latest
+    mv somatosim_latest.sif tools/
+    conda deactivate &>/dev/null
+else
+    echo "SomatoSim ready for simulation..."
+fi
+
+# Launch jobs
+if compgen -G "$PROJECT_DIR"/BAMs_mutated/Guided/*.somatosim.bam > /dev/null; then
+    echo "Previously mutated BAMs are present in the Guided folder."
+else
+    echo "Starting Guided Clonal Simulation..."
+    echo "(This may take a while)"
+    bash scripts/sim_guided \
+        -f "$VCF_File" \
+        -i "$PROJECT_DIR" \
+        -n 100 \
+        &> "$PROJECT_DIR"/Logs/sim_guided.log
+    mv "$PROJECT_DIR"/BAMs_mutated/Guided/*/*.bam* \
+       "$PROJECT_DIR"/BAMs_mutated/Guided/
+    wait
+    echo -e "Done!!\n"
+fi
+
+if compgen -G "$PROJECT_DIR"/BAMs_mutated/Stochastic/*.somatosim.bam > /dev/null; then
+    echo "Previously mutated BAMs are present in the Stochastic folder."
+else
+    echo "Starting Stochastic Clonal Simulation..."
+    echo "(This may take a while)"
+    bash scripts/sim_stochastic \
+        -f "$BED_File" \
+        -i "$PROJECT_DIR" \
+        -n 100 \
+        &> "$PROJECT_DIR"/Logs/sim_stochastic.log
+
+    mv "$PROJECT_DIR"/BAMs_mutated/Stochastic/*/*.bam* \
+       "$PROJECT_DIR"/BAMs_mutated/Stochastic/
+    wait
+
+    echo "Done!!"
+fi
+
+
+# ******************************************************************************
+# *                                                                            *
+# *                        V a r i a n t   C a l l i n g                       *
+# *                                                                            *
+# ******************************************************************************
+
+echo -e "\nVariant Calling\n---------------"
+
+# Launch FreeBayes
+echo "Launching Freebayes..."
+if compgen -G "$PROJECT_DIR"/VCFs/Guided/FreeBayes/*.vcf.gz > /dev/null; then
+    echo "VCFs are present in the Guided/Freebayes folder. Overwriting was avoided!"
+else
+    bash scripts/freebayes \
+        -i "$PROJECT_DIR"/BAMs_mutated/Guided \
+        -r "$REFERENCE_FILE" \
+        -o "$PROJECT_DIR"/VCFs/Guided/FreeBayes \
+        &> "$PROJECT_DIR"/Logs/Freebayes_guided.log
+fi
+
+if compgen -G "$PROJECT_DIR"/VCFs/Stochastic/FreeBayes/*.vcf.gz > /dev/null; then
+    echo "VCFs are present in the Stochastic/Freebayes folder. Overwriting was avoided!"
+else
+    bash scripts/freebayes \
+        -i "$PROJECT_DIR"/BAMs_mutated/Stochastic \
+        -r "$REFERENCE_FILE" \
+        -o "$PROJECT_DIR"/VCFs/Stochastic/FreeBayes \
+        &> "$PROJECT_DIR"/Logs/Freebayes_stochastic.log 
+fi
+echo -e "Done!!\n"
+
+
+# Launch LoFreq
+echo "Launching LoFreq..."
+if compgen -G "$PROJECT_DIR"/VCFs/Guided/LoFreq/*.vcf.gz > /dev/null; then
+    echo "VCFs are present in the Guided/LoFreq folder. Overwriting was avoided!"
+else
+    bash scripts/lofreq \
+        -i "$PROJECT_DIR"/BAMs_mutated/Guided \
+        -r "$REFERENCE_FILE" \
+        -o "$PROJECT_DIR"/VCFs/Guided/LoFreq \
+        &> "$PROJECT_DIR"/Logs/Freebayes_guided.log
+fi
+
+if compgen -G "$PROJECT_DIR"/VCFs/Stochastic/LoFreq/*.vcf.gz > /dev/null; then
+    echo "VCFs are present in the Stochastic/LoFreq folder. Overwriting was avoided!"
+else
+    bash scripts/lofreq \
+        -i "$PROJECT_DIR"/BAMs_mutated/Stochastic \
+        -r "$REFERENCE_FILE" \
+        -o "$PROJECT_DIR"/VCFs/Stochastic/LoFreq \
+        &> "$PROJECT_DIR"/Logs/LoFreq_stochastic.log
+fi
+echo -e "Done!!\n"
+
+
+# Launch Mutect2
+echo "Launching Mutect2..."
+if compgen -G "$PROJECT_DIR"/VCFs/Guided/Mutect2/*.vcf.gz > /dev/null; then
+    echo "VCFs are present in the Guided/Mutect2 folder. Overwriting was avoided!"
+else
+    bash scripts/mutect2 \
+        -i "$PROJECT_DIR"/BAMs_mutated/Guided \
+        -r "$REFERENCE_FILE" \
+        -o "$PROJECT_DIR"/VCFs/Guided/Mutect2 \
+        &> "$PROJECT_DIR"/Logs/Mutect2_guided.log
+fi
+
+if compgen -G "$PROJECT_DIR"/VCFs/Stochastic/Mutect2/*.vcf.gz > /dev/null; then
+    echo "VCFs are present in the Stochastic/Mutect2 folder. Overwriting was avoided!"
+else
+    bash scripts/mutect2 \
+        -i "$PROJECT_DIR"/BAMs_mutated/Stochastic \
+        -r "$REFERENCE_FILE" \
+        -o "$PROJECT_DIR"/VCFs/Stochastic/Mutect2 \
+        &> "$PROJECT_DIR"/Logs/Mutect2_stochastic.log
+fi
+echo -e "Done!!\n"
+
+
+# Launch Strelka2
+echo "Launching Strelka2..."
+if compgen -G "$PROJECT_DIR"/VCFs/Guided/Strelka2/*.vcf.gz > /dev/null; then
+    echo "VCFs are present in the Guided/Strelka2 folder. Overwriting was avoided!"
+else
+    bash scripts/strelka2 \
+        -i "$PROJECT_DIR"/BAMs_mutated/Guided \
+        -r "$REFERENCE_FILE" \
+        -o "$PROJECT_DIR"/VCFs/Guided/Strelka2 \
+        &> "$PROJECT_DIR"/Logs/Strelka2_guided.log
+fi
+
+if compgen -G "$PROJECT_DIR"/VCFs/Stochastic/Strelka2/*.vcf.gz > /dev/null; then
+    echo "VCFs are present in the Stochastic/Strelka2 folder. Overwriting was avoided!"
+else
+    bash scripts/strelka2 \
+        -i "$PROJECT_DIR"/BAMs_mutated/Stochastic \
+        -r "$REFERENCE_FILE" \
+        -o "$PROJECT_DIR"/VCFs/Stochastic/Strelka2 \
+        &> "$PROJECT_DIR"/Logs/Strelka2_stochastic.log
+fi
+echo -e  "Done!!\n"
+conda deactivate &> /dev/null
+
+# Launch VarScan2
+echo "Launching VarScan2..."
+if compgen -G "$PROJECT_DIR"/VCFs/Guided/VarScan2/*.vcf.gz > /dev/null; then
+    echo "VCFs are present in the Guided/VarScan2 folder. Overwriting was avoided!"
+else
+    bash scripts/varscan2 \
+        -i "$PROJECT_DIR"/BAMs_mutated/Guided \
+        -r "$REFERENCE_FILE" \
+        -o "$PROJECT_DIR"/VCFs/Guided/VarScan2 \
+        &> "$PROJECT_DIR"/Logs/VarScan2_guided.log
+fi
+
+if compgen -G "$PROJECT_DIR"/VCFs/Stochastic/VarScan2/*.vcf.gz > /dev/null; then
+    echo "VCFs are present in the Stochastic/VarScan2 folder. Overwriting was avoided!"
+else
+    bash scripts/varscan2 \
+        -i "$PROJECT_DIR"/BAMs_mutated/Stochastic \
+        -r "$REFERENCE_FILE" \
+        -o "$PROJECT_DIR"/VCFs/Stochastic/VarScan2 \
+        &> "$PROJECT_DIR"/Logs/VarScan2_stochastic.log
+fi
+echo -e "Done!!\n"
+
+
+# ******************************************************************************
+# *                                                                            *
+# *                         V C F   C o m p a r i s o n                        *
+# *                                                                            *
+# ******************************************************************************
+
+
+source $(conda info --base)/etc/profile.d/conda.sh &> /dev/null
+conda init &> /dev/null
+conda activate tools &> /dev/null
+
+# Generate VCFs for reference
+for file in "$PROJECT_DIR"/BAMs_mutated/Guided/*/simulation_output.txt; do
+    folder_name=$(basename "$(dirname "$file")")
+    python3 scripts/vcf_generator.py \
+        -i "$file" \
+        -o "$PROJECT_DIR"/VCFs/Guided/REFs/"$folder_name"
+done
+
+for file in "$PROJECT_DIR"/BAMs_mutated/Stochastic/*/simulation_output.txt; do
+    folder_name=$(basename "$(dirname "$file")")
+    python3 scripts/vcf_generator.py \
+        -i "$file" \
+        -o "$PROJECT_DIR"/VCFs/Stochastic/REFs/"$folder_name"
+done
+
+# Sort, compress and index Truth Sets
+for file in "$PROJECT_DIR"/VCFs/*/REFs/*.vcf; do
+    bcftools sort "$file" 1> tmp 2> /dev/null
+    mv tmp "$file"
+    bgzip "$file"
+    bcftools index "$file".gz &> /dev/null
+done
+
+# Executing vcf_compare and generating metrics
+bash scripts/vcf_compare \
+    -i  "$PROJECT_DIR"/VCFs/Guided \
+    -o1 "$PROJECT_DIR"/Analysis/raw_guided_general_results.txt \
+    -o2 "$PROJECT_DIR"/Analysis/raw_guided_detailed_results.txt \
+    &> /dev/null
+wait
+
+bash scripts/vcf_compare \
+    -i  "$PROJECT_DIR"/VCFs/Stochastic \
+    -o1 "$PROJECT_DIR"/Analysis/raw_stochastic_general_results.txt \
+    -o2 "$PROJECT_DIR"/Analysis/raw_stochastic_detailed_results.txt \
+    &> /dev/null
+wait
+
+python3 scripts/matrix_gen.py \
+    -g "$PROJECT_DIR"/Analysis/raw_guided_general_results.txt \
+    -d "$PROJECT_DIR"/Analysis/raw_guided_detailed_results.txt
+
+python3 scripts/matrix_gen.py \
+    -g "$PROJECT_DIR"/Analysis/raw_stochastic_general_results.txt \
+    -d "$PROJECT_DIR"/Analysis/raw_stochastic_detailed_results.txt
+
+
+conda deactivate &> /dev/null
+echo "CloneSim4Bench has finish the analysis."
+echo "Goodbye!"

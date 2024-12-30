@@ -1,0 +1,637 @@
+---
+title-block-banner: true
+title: "Análisis Comparativo del Impacto de la Simulación Estocástica vs. Guiada de Mutaciones Somáticas en Secuencias de Exoma Completo sobre el Rendimiento de los Llamadores de Variantes en Modo Tumor-Only"
+author: "Alex Fernando Arita Arita"
+format:
+  html:
+    theme: cerulean
+    html-math-method: katex
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-copy: hover
+    toc: true
+    self-contained: true
+editor: visual
+lang: es
+---
+
+# Justificación
+
+El presente estudio se centra en la evaluación de las capacidades técnicas de los llamadores de variantes en la identificación de Hematopoyesis Clonal de Potencial Indeterminado *(Clonal Hematopoiesis of Indeterminate Potential, CHIP)* mediante el análisis de secuencias de exoma completo *(Whole Exome Sequencing, WES)* obtenidas de muestras de sangre periférica.
+
+Tradicionalmente, la identificación de variantes somáticas ha estado estrechamente vinculada a sus implicaciones oncológicas. Sin embargo, en la última década se ha descubierto que estas variantes también están asociadas con una amplia gama de enfermedades no oncológicas, como la enfermedad coronaria, el accidente cerebrovascular isquémico, la insuficiencia cardíaca congestiva, la aterosclerosis, la enfermedad pulmonar obstructiva crónica, la diabetes tipo 2 y diversas afecciones neuropsiquiátricas.
+
+Los algoritmos de detección de variantes somáticas suelen estar optimizados para el análisis de muestras en modo "tumor vs. normal", mientras que su rendimiento en el modo "solo tumor" *(tumor-only)* ha sido menos explorado. Dado que este último enfoque es particularmente relevante para la identificación de CHIPs, resulta crucial evaluar el desempeño de estos callers y su aplicabilidad en este contexto.
+
+# Método
+
+## Workflow
+
+El **workflow** de *CloneSim4Bench-mini* se basa en tres etapas principales:
+
+1.  **Preprocesado de muestras**: Se sigue el [workflow del equipo GATK del Broad Institute para el descubrimiento de variantes](https://gatk.broadinstitute.org/hc/en-us/articles/360035535912-Data-pre-processing-for-variant-discovery), que incluye pasos como la alineación de lecturas, la deduplicación y la recalibración de bases.
+
+2.  **Generación de variantes**: Se emplea [SomatoSim](https://github.com/BieseckerLab/SomatoSim), una herramienta que simula variantes somáticas en datos de secuenciación. El proceso incluye la utilización de `BED4SV.py` para generar archivos BED con las posiciones a alterar en el genoma.
+
+3.  **Llamado de variantes**: Se realiza el llamado de variantes utilizando varias herramientas de *variant calling* como **FreeBayes**, **LoFreq**, **Mutect2**, **Strelka2** y **VarScan2**. Los resultados generados por estas herramientas se comparan con un *truth set* para evaluar su rendimiento.
+
+![Workflow - CloneSim4Bench-mini](D://CloneSim4Bench-mini/resources/workflow.png)
+
+### Consideraciones sobre CloneSim4Bench-mini
+
+Uno de los principales aspectos a considerar sobre CloneSim4Bench-mini es la considerable cantidad de espacio que requieren sus recursos. Las imágenes SIF ocupan alrededor de 3 GB, mientras que los VCF de referencia con variantes conocidas alcanzan aproximadamente 20 GB. Además, es importante tener en cuenta el espacio necesario para los archivos BAM, así como los BAM mutados que se generarán durante su ejecución.
+
+## Muestras
+
+En este análisis, se emplearon tres muestras distintas para los enfoques guiado y estocástico. Las muestras corresponden a secuencias de exoma completo de la familia Han (HG005, HG006, HG007) con cobertura 100x del Genome in a Bottle Consortorium, disponibles en [Google Brain Genomics Sequencing Dataset for Benchmarking and Development](https://registry.opendata.aws/google-brain-genomics-public).
+
+**Nota:** Este trabajo representa una prueba de concepto y una adaptación de un proyecto de mayor envergadura. Para optimizar su ejecución y facilitar la exploración, se decidió restringir el análisis únicamente al cromosoma 22 de cada muestra. Sin embargo, es importante destacar que esta elección podría introducir sesgos en los resultados debido al alto número de eventos concentrados en una región genómica relativamente pequeña. Para obtener conclusiones más representativas en un análisis aplicado, se recomienda utilizar las secuencias completas de las muestras.
+
+```{R}
+#| echo: FALSE
+#| warning: False
+
+if (!require("rmarkdown")) install.packages("rmarkdown")
+if (!require("ggplot2")) install.packages("ggplot2")
+if (!require("gridExtra")) install.packages("gridExtra")
+if (!require("tidyr")) install.packages("tidyr")
+if (!require("stringr")) install.packages("stringr")
+if (!require("reshape2")) install.packages("reshape2")
+if (!require("viridis")) install.packages("viridis")
+
+library("viridis")
+library("ggplot2")
+library("gridExtra")
+library("tidyr")
+library("stringr")
+library("reshape2")
+
+project_dir="D://test/"
+
+bam_list <- function(file_path) {
+  if (!file.exists(file_path)) {
+    stop(paste("ERROR: Wrong filepath", file_path), call. = FALSE)
+  }
+  bams_list <- list.files(path = file.path(file_path,"BAMs"), 
+                          all.files = TRUE, 
+                          full.names = FALSE,
+                          pattern = ".bam")
+  bams_list <- lapply(bams_list, function(x) sub("\\.sorted\\.dedup\\.recal\\.bam$", "", x))
+  return(bams_list)
+}
+
+BAMs <- bam_list(project_dir)
+```
+
+```{r}
+print(BAMs)
+```
+
+## Equipo
+
+La ejecución se realizó en un portátil Asus ROG Zephyrus G14 GA401QM, configurado con un procesador AMD Ryzen 7 5800HS, 40 GB de memoria RAM a 2666 MHz y un disco SSD M.2 NVMe de 1 TB. El sistema operativo principal fue Windows 11 (versión 24H2). Para garantizar la compatibilidad y el óptimo desempeño del pipeline bioinformático, se empleó el Subsistema de Windows para Linux (WSL), específicamente la versión 2.3.26.0.
+
+## Herramientas bioinformáticas
+El análisis se llevó a cabo utilizando un conjunto de herramientas bioinformáticas ampliamente reconocidas, que incluyen:
+
+-   bwa (versión 0.7.17-r1188) para la alineación de secuencias.
+-   samtools (versión 1.13) para manipulación de archivos SAM/BAM.
+-   GATK (versión 4.5.0.0) para la llamada y procesamiento de variantes.
+-   Somatosim (versión 1.0) para la generación de datasets mutados.
+-   FreeBayes (versión 1.3.6), LoFreq (versión 2.1.5), Strelka2 (versión 2.9.10) y VarScan (versión 2.4.5) para la detección de variantes somáticas.
+-   VCFTools (versión 0.1.16) y BCFTools (versión 1.13) para el manejo y análisis de archivos VCF.
+-   Python (versión 3.12.6) para el desarrollo de scripts y análisis personalizados.
+-   Singularity-CE (versión 3.9.5) para la ejecución de contenedores en entornos reproducibles.
+
+Esta combinación de hardware y software permitió realizar análisis bioinformáticos de alta complejidad de manera eficiente y reproducible.
+
+# Resultados
+
+## SomatoSim
+
+### Parámetros
+
+Para garantizar la replicabilidad del análisis, se especifican a continuación los parámetros utilizados: la semilla y el número de variantes solicitadas. Estos valores se emplearon tanto en el script BED4SV.py como en la herramienta SomatoSim para seleccionar las posiciones genómicas a mutar.
+
+```{R}
+#| echo = FALSE
+
+extraer_datos <- function(archivo) {
+  # Read the file content
+  log_text <- readLines(archivo)
+  
+  seed <- log_text[grep("Random seed:", log_text)] %>%
+    sub(".*Random seed: (\\d+).*", "\\1", .) %>%
+    as.numeric()
+  
+  variants_asked <- log_text[grep("Number of positions to mutate:", log_text)] %>%
+    sub(".*Number of positions to mutate: (\\d+).*", "\\1", .) %>%
+    as.numeric()
+  
+  variants_obtained <- log_text[grep("Final number of unique spike-in positions inside the target VAF value range:", log_text)] %>%
+    sub(".*Final number of unique spike-in positions inside the target VAF value range: (\\d+).*", "\\1", .) %>%
+    as.numeric()
+  
+  runtime <- log_text[grep("Total runtime:", log_text)] %>%
+    sub(".*Total runtime: (\\d+).*", "\\1", .) %>%
+    as.numeric()
+  
+  ruta_dividida <- strsplit(archivo, "/+")[[1]]
+  metodo <- ruta_dividida[length(ruta_dividida) - 2]
+  muestra <- ruta_dividida[length(ruta_dividida) - 1]
+  
+  data.frame(
+    Approach = metodo,
+    Sample = muestra,
+    Seed = seed,
+    variants_asked = variants_asked,
+    variants_obtained = variants_obtained,
+    Runtime = runtime,
+    stringsAsFactors = FALSE
+  )
+}
+
+read_and_process_somatosim <- function(project_dir) {
+  archivos <- list.files(
+    path = file.path(project_dir, "BAMs_mutated"),
+    pattern = "simulation_log.txt",
+    full.names = TRUE,
+    recursive = TRUE
+  )
+  
+  if (length(archivos) == 0) {
+    stop("No files were found in the filepath.")
+  }
+  
+  resultados <- lapply(archivos, extraer_datos)
+  resultados <- do.call(rbind, resultados[!sapply(resultados, is.null)])
+  resultados <- unique(resultados)
+  return(resultados)
+}
+
+DT::datatable(read_and_process_somatosim(project_dir),rownames = FALSE)
+```
+
+### Frecuencia Alélica
+
+Según investigaciones previas, el rango de frecuencias alélicas recomendado para las variantes introducidas oscila entre 0.02 y 0.2. Con el objetivo de evaluar los resultados de la simulación somática, se presentan a continuación los datos obtenidos a partir de dicha simulación, los cuales permiten valorar el desempeño del enfoque implementado.
+
+::: panel-tabset
+#### Datos
+
+```{R}
+#| echo = FALSE
+
+vaf_output <- function(log_file) {
+  log_text <- readLines(log_file)
+
+  start_line <- grep("VAF distribution \\(output\\):", log_text)
+  end_line <- grep("Alternate allele distribution \\(output\\):", log_text)
+  if (length(start_line) == 0 || length(end_line) == 0) {
+    warning(paste("No se pudo localizar la sección de VAF en el archivo:", log_file))
+    return(NULL)
+  }
+  vaf_section <- log_text[(start_line + 1):(end_line - 1)]
+  
+  start_vaf <- grep("\\[\\[", vaf_section)
+  end_vaf <- grep("\\]\\]", vaf_section)
+  if (length(start_vaf) == 0 || length(end_vaf) == 0) {
+    warning(paste("No se encontraron datos VAF válidos en el archivo:", log_file))
+    return(NULL)
+  }
+  vaf_section <- vaf_section[start_vaf:end_vaf]
+  
+  vaf_section <- gsub("\\[|\\]", "", vaf_section)
+  vaf_section <- str_trim(vaf_section)
+  
+  vaf_distribution <- do.call(rbind, strsplit(vaf_section, "\\s+"))
+  vaf_distribution <- data.frame(
+    VAF = as.numeric(vaf_distribution[, 1]),
+    Count = as.numeric(vaf_distribution[, 2]),
+    stringsAsFactors = FALSE
+  )
+  
+  ruta_dividida <- strsplit(log_file, "/+")[[1]]
+  metodo <- ruta_dividida[length(ruta_dividida) - 2]
+  muestra <- ruta_dividida[length(ruta_dividida) - 1]
+  
+  # Añadir columnas de Approach y Sample
+  vaf_distribution$Approach <- metodo
+  vaf_distribution$Sample <-muestra
+  
+  return(vaf_distribution)
+}
+
+read_vaf_output <- function(project_dir) {
+  files <- list.files(
+    path = file.path(project_dir, "BAMs_mutated"),
+    pattern = "simulation_log.txt",
+    full.names = TRUE,
+    recursive = TRUE
+  )
+  
+  if (length(files) == 0) {
+    stop("No files were found in the filepath.")
+  }
+  
+  results <- lapply(files, vaf_output)
+  results <- results[!sapply(results, is.null)]
+  
+  all_results <- do.call(rbind, results)
+  all_results[is.na(all_results)] <- 0
+  vaf_matrix <- reshape(all_results, 
+                        idvar = c("Approach", "Sample"), 
+                        timevar = "VAF", 
+                        direction = "wide", 
+                        v.names = "Count")
+  colnames(vaf_matrix) <- gsub("Count\\.", "", colnames(vaf_matrix))
+  
+  return(vaf_matrix)
+}
+vaf_matrix <- read_vaf_output(project_dir)
+DT::datatable(vaf_matrix,rownames = FALSE)
+```
+
+#### Gráfico
+
+```{R}
+#| echo: FALSE
+#| warning: FALSE
+vaf_long <- melt(vaf_matrix, 
+                 id.vars = c("Approach", "Sample"), 
+                 variable.name = "VAF", 
+                 value.name = "Count")
+
+vaf_long$VAF <- as.numeric(as.character(vaf_long$VAF))
+
+ggplot(vaf_long, aes(x = VAF, y = Count, color = Approach, group = interaction(Approach, Sample))) +
+  geom_boxplot(aes(group = interaction(VAF, Approach)), 
+               outlier.shape = NA) +
+  labs(title = "Distribución de VAF por Método",
+       x = "Frecuencia Alélica (VAF)",
+       y = "Recuento") +
+  facet_wrap(~Approach, ncol = 1) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    strip.text = element_text(size = 12, face = "bold"),
+    panel.grid.major.x = element_line(color = "gray80", linetype = "dotted"),
+    panel.grid.major.y = element_line(color = "gray80", linetype = "dotted"),
+    axis.text.y = element_text(size = 5, face = "bold")
+  ) +
+  scale_x_continuous(
+    breaks = seq(min(vaf_long$VAF, na.rm = TRUE), max(vaf_long$VAF, na.rm = TRUE), by = 0.02),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  scale_y_continuous(
+    breaks = scales::breaks_pretty(n = 10),
+    labels = function(x) format(x, nsmall = 0)
+  ) +
+  scale_color_viridis_d(option = "F", begin = 0.5, end = 0.8) 
+```
+:::
+
+
+## Resultados Generales de la Ejecución
+
+Para evaluar el rendimiento de cada llamador de variantes, se generó un *"truth set"* a partir de los archivos *"simulation_output.txt"* producidos por SomatoSim durante la simulación. Posteriormente, se realizaron comparaciones utilizando la herramienta vcf-compare de VCFTools.
+
+```{R}
+#| echo: FALSE
+
+read_and_process_matrix <- function(file_path) {
+  if (!file.exists(file_path)) {
+    stop(paste("ERROR: File not found:", file_path), call. = FALSE)
+  }
+  data <- read.csv(file_path, head = TRUE, sep = "\t")
+  
+  # Separar "File" en "File" y "Coverage"
+  data <- data %>%
+    separate(File, into = c("File", "Coverage"), sep = "\\.", extra = "merge", fill = "right")
+  
+  # Redondear columnas numéricas a 2 decimales si es necesario
+  numeric_cols <- sapply(data, is.numeric)
+  data[numeric_cols] <- lapply(data[numeric_cols], round, digits = 4)
+  
+  return(data)
+}
+
+metrics_graphics <- function(data) {
+  base_theme <- theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "top",
+      strip.text = element_text(size = 12, face = "bold"),
+      axis.text.x = element_text(angle = 90, hjust = 1, size = 10),
+      panel.grid.major = element_line(color = "gray80", linetype = "dotted")
+    )
+  
+  list(
+    Sensitivity = ggplot(data, aes(x = Caller, y = Sensitivity, fill = Coverage)) +
+      geom_boxplot() + facet_wrap(~ Coverage) +
+      ggtitle("Sensitivity") + xlab("") + ylab("Rate") + 
+      scale_fill_viridis_d(option = "C", begin = 0.5,
+                           end = 0.8, name = "Coverage") +
+      base_theme,
+    
+    Specificity = ggplot(data, aes(x = Caller, y = Specificity, fill = Coverage)) +
+      geom_boxplot() + facet_wrap(~ Coverage) +
+      ggtitle("Specificity") + xlab("") + ylab("Rate") + 
+      scale_fill_viridis_d(option = "C", begin = 0.5,
+                           end = 0.8, name = "Coverage") +
+      base_theme,
+    
+    Precision = ggplot(data, aes(x = Caller, y = Precision, fill = Coverage)) +
+      geom_boxplot() + facet_wrap(~ Coverage) +
+      ggtitle("Precision") + xlab("") + ylab("Rate") + 
+      scale_fill_viridis_d(option = "C", begin = 0.5,
+                           end = 0.8, name = "Coverage") +
+      base_theme,
+    
+    Accuracy = ggplot(data, aes(x = Caller, y = Accuracy, fill = Coverage)) +
+      geom_boxplot() + facet_wrap(~ Coverage) +
+      ggtitle("Accuracy") + xlab("") + ylab("Rate") + 
+      scale_fill_viridis_d(option = "C", begin = 0.5,
+                           end = 0.8, name = "Coverage") +
+      base_theme,
+    
+    FPR = ggplot(data, aes(x = Caller, y = FPR, fill = Coverage)) +
+      geom_boxplot() + facet_wrap(~ Coverage) +
+      ggtitle("FPR") + xlab("") + ylab("Rate") + 
+      scale_fill_viridis_d(option = "C", begin = 0.5,
+                           end = 0.8, name = "Coverage") +
+      base_theme,
+    
+    FNR = ggplot(data, aes(x = Caller, y = FNR, fill = Coverage)) +
+      geom_boxplot() + facet_wrap(~ Coverage) +
+      ggtitle("FNR") + xlab("") + ylab("Rate") + 
+      scale_fill_viridis_d(option = "C", begin = 0.5,
+                           end = 0.8, name = "Coverage") +
+      base_theme,
+    
+    F1_Score = ggplot(data, aes(x = Caller, y = F1.Score, fill = Coverage)) +
+      geom_boxplot() + facet_wrap(~ Coverage) +
+      ggtitle("F1 Score") + xlab("") + ylab("Rate") + 
+      scale_fill_viridis_d(option = "C", begin = 0.5,
+                           end = 0.8, name = "Coverage") +
+      base_theme
+  )
+}
+```
+
+::: panel-tabset
+### Datos - Guiado
+
+```{R}
+#| echo: FALSE
+#| warning: FALSE
+guided <- read_and_process_matrix(file.path(project_dir,
+                                            "Analysis/raw_guided_general_results.tsv")
+                                            )
+guided_plots <- metrics_graphics(guided)
+DT::datatable(guided)
+```
+
+### Gráfico - Guiado
+
+::: panel-tabset
+##### Sensitivity
+
+```{r}
+#| echo: FALSE
+guided_plots$Sensitivity
+```
+
+#### Specificity
+
+```{r}
+#| echo: FALSE
+guided_plots$Specificity
+```
+
+#### Precision
+
+```{r}
+#| echo: FALSE
+guided_plots$Precision
+```
+
+#### Accuracy
+
+```{r}
+#| echo: FALSE
+guided_plots$Accuracy
+```
+
+#### FPR
+
+```{r}
+#| echo: FALSE
+guided_plots$FPR
+```
+
+#### FNR
+
+```{r}
+#| echo: FALSE
+guided_plots$FNR
+```
+
+#### F1 Score
+
+```{r}
+#| echo: FALSE
+guided_plots$F1_Score
+```
+:::
+
+### Datos - Estocástico
+
+```{R}
+#| echo: FALSE
+#| warning: FALSE
+stochastic <- read_and_process_matrix(file.path(project_dir,
+                                                "Analysis/raw_stochastic_general_results.tsv")
+                                                )
+stochastic_plots <- metrics_graphics(stochastic)
+DT::datatable(stochastic)
+```
+
+### Gráfico - Estocástico
+
+::: panel-tabset
+#### Sensitivity
+
+```{r}
+#| echo: FALSE
+stochastic_plots$Sensitivity
+```
+
+#### Specificity
+
+```{r}
+#| echo: FALSE
+stochastic_plots$Specificity
+```
+
+#### Precision
+
+```{r}
+#| echo: FALSE
+stochastic_plots$Precision
+```
+
+#### Accuracy
+
+```{r}
+#| echo: FALSE
+stochastic_plots$Accuracy
+```
+
+#### FPR
+
+```{r}
+#| echo: FALSE
+stochastic_plots$FPR
+```
+
+#### FNR
+
+```{r}
+#| echo: FALSE
+stochastic_plots$FNR
+```
+
+#### F1 Score
+
+```{r}
+#| echo: FALSE
+stochastic_plots$F1_Score
+```
+:::
+:::
+
+## Resultados Detallados de la Ejecución
+
+Un *"truth-set"* y comparaciones fueron realizadas siguiendo los mismos pasos que en el apartado anterior. En esta sección el enfoque se ubica en las frecuencias alélicas potencialmente detectables por cada uno de los variant callers.
+
+```{R}
+#| echo: FALSE
+graphic <- function(data){
+  data$AF <- factor(
+                    data$AF, 
+                    levels = c("< 0.02",
+                               "0.02 - 0.05", 
+                               "0.05 - 0.1", 
+                               "> 0.1")
+                   )
+  
+  ggplot(data, aes(x = AF, y = Ratio, fill = Caller)) +
+    geom_boxplot(outlier.shape = NA) +
+    labs(
+      title = "Distribución de porcentajes de llamadas por VAF y Caller",
+      x = "Rango de Frecuencia Alélica (VAF)",
+      y = "Porcentaje de Llamadas",
+      fill = "Caller"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "top",
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid.major.x = element_line(color = "gray90", 
+                                        linetype = "dotted"),
+      panel.grid.major.y = element_line(color = "gray90", 
+                                        linetype = "dotted"),
+      strip.text = element_text(size = 12, face = "bold")
+    ) +
+    facet_wrap(~ Caller, ncol = 7) +
+    scale_fill_viridis_d(option = "F", begin = 0.2, end = 0.8)
+}
+```
+
+::: panel-tabset
+### Datos - Guiado
+
+```{R}
+#| echo: FALSE
+#| warning: FALSE
+guided <- read.csv(file.path(project_dir,                                                 "Analysis/raw_guided_detailed_results.tsv"),
+                   sep = "\t",
+                   header = TRUE,
+                   stringsAsFactors = FALSE
+                        )
+DT::datatable(guided)
+```
+
+### Gráfico - Guiado
+
+```{R}
+#| echo: FALSE
+#| warning: FALSE
+graphic(guided)
+```
+
+### Datos - Estocástico
+
+```{R}
+#| echo: FALSE
+#| warning: FALSE
+stochastic <- read.csv(file.path(project_dir,                                                 "Analysis/raw_stochastic_detailed_results.tsv"),
+                   sep = "\t",
+                   header = TRUE,
+                   stringsAsFactors = FALSE
+                        )
+DT::datatable(stochastic)
+```
+
+### Gráfico - Estocástico
+
+```{R}
+#| echo: FALSE
+#| warning: FALSE
+graphic(stochastic)
+```
+:::
+
+# Discusión
+
+El análisis realizado en este estudio proporciona una visión detallada del rendimiento de los llamadores de variantes somáticas bajo dos enfoques de simulación: estocástico y guiado. Los resultados obtenidos permiten extraer varias conclusiones significativas, así como identificar áreas para futuras investigaciones.
+
+## Rendimiento comparativo entre enfoques
+
+### Eficiencia de los métodos:
+
+El enfoque guiado mostró un rendimiento más consistente en términos de sensibilidad y precisión, probablemente debido a la orientación directa de las variantes hacia regiones específicas del genoma, minimizando la aleatoriedad y maximizando la recuperación de mutaciones simuladas.
+Por otro lado, el enfoque estocástico, si bien es representativo de la naturaleza aleatoria de las mutaciones, presentó mayor variabilidad en las métricas de detección, especialmente en variantes de baja frecuencia alélica.
+
+### Cobertura y frecuencia alélica:
+
+Los llamadores de variantes mostraron diferencias notables en su capacidad para detectar variantes en rangos de frecuencia alélica bajos (<0.05). Este resultado subraya la importancia de seleccionar la herramienta adecuada según los objetivos específicos del estudio, como la identificación de mutaciones raras asociadas a CHIP.
+
+### Robustez de los llamadores:
+
+Entre las herramientas evaluadas, Mutect2 y LoFreq demostraron ser las más robustas en ambos enfoques, con una alta sensibilidad y precisión. Estas características las posicionan como opciones viables para estudios en modo tumor-only.
+
+## Limitaciones del estudio
+
+### Restricción al cromosoma 22:
+
+Aunque esta elección permitió una ejecución más eficiente, pudo introducir sesgos debido a la concentración de eventos mutacionales en una región limitada del genoma.
+
+### Conjunto de verdad (truth set) limitado:
+
+Si bien los resultados son representativos, un análisis más amplio que incluya muestras completas de exoma o genoma puede ofrecer conclusiones más generalizables.
+
+## Implicaciones prácticas y futuras direcciones
+
+### Relevancia clínica:
+
+Este trabajo resalta la viabilidad del modo tumor-only para la identificación de variantes asociadas a CHIP, lo que puede ser particularmente útil en contextos clínicos donde no se dispone de muestras normales como referencia.
+
+### Mejoras a futuro:
+
+Sería interesante explorar ajustes específicos en las herramientas de variant calling para optimizar su desempeño en variantes de baja frecuencia y mejorar la precisión en escenarios complejos.
+
+### Extensión del análisis:
+
+Futuros estudios podrían evaluar el impacto de la cobertura y la calidad de las lecturas sobre la capacidad de detección, así como incluir un mayor número de muestras y cromosomas para validar los resultados observados.
