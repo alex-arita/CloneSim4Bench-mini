@@ -55,7 +55,7 @@ Started](docs/Getting_Started.md) section.
 To obtain the main scripts, clone the repository using Git:
 
 ```bash
-git clone https://github.com/alex-arita/CloneSim4Bench
+git clone https://github.com/alex-arita/CloneSim4Bench-mini
 cd CloneSim4Bench
 ./main -i <input_dir> -o <project_dir> -r <reference> -v <vcf_file> -b <bed_file>
 ```
