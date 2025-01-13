@@ -51,14 +51,13 @@ python3 -m pip install .
 It is important to note that a common issue mentioned in the repository is related to the decimal delimiter. To address this, the authors provide a Docker image available at Docker Hub. Additionally, a Singularity image can be generated using the following commands:
 
 ```bash
-module load singularity
+conda activate tools
 singularity pull docker://marwanhawari/somatosim
 ```
 
 **Note**: 
 -   The SomatoSim image must be located in the tools folder. Otherwise, it will be downloaded by the script.
 -   Due to the issue with the decimal delimiter, SomatoSim was configured to work from a SIF image.
--   For further information about the software and its parameters, [click here](SomatoSim.md).
 
 ### External files
 
